@@ -1,0 +1,77 @@
+name: dispatch-agent
+# KEEP OFF — leave repository variable AGENT_DISPATCH_ENABLED unset (not 'true'); dispatch stays disabled.
+# Event-driven: launches at most ONE Cursor cloud agent per run for this repo.
+# Gated by repo variable AGENT_DISPATCH_ENABLED == 'true' (off by default).
+on:
+  workflow_dispatch:
+  issues: { types: [labeled] }
+  pull_request: { types: [closed] }
+permissions: { contents: read, issues: write, pull-requests: read }
+concurrency:
+  group: "cursor-dispatch-${{ github.repository }}"
+  cancel-in-progress: false
+jobs:
+  dispatch:
+    if: >
+      vars.AGENT_DISPATCH_ENABLED == 'true' &&
+      (github.event_name == 'workflow_dispatch' ||
+       (github.event_name == 'issues' && github.event.label.name == 'agent-task') ||
+       (github.event_name == 'pull_request' && github.event.pull_request.merged == true))
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+      API: https://api.cursor.com
+    steps:
+      - name: Guard - key present
+        run: '[ -n "$CURSOR_API_KEY" ] || { echo "CURSOR_API_KEY secret missing"; exit 1; }'
+      - name: Dedupe - skip if an agent for this repo is ACTIVE or a task is in progress
+        id: dedupe
+        run: |
+          busy=$(gh issue list -R "$REPO" --label agent-in-progress --state open --json number --jq 'length')
+          if [ "$busy" != "0" ]; then echo "skip=1" >> $GITHUB_OUTPUT; echo "Task in progress; skip"; exit 0; fi
+          # GET /v1/agents has no repo filter; check recent ACTIVE agents' repos via GET /v1/agents/{id}
+          for id in $(curl -fsS -u "$CURSOR_API_KEY:" "$API/v1/agents?limit=20&includeArchived=false" | jq -r '.items[] | select(.status=="ACTIVE") | .id'); do
+            if curl -fsS -u "$CURSOR_API_KEY:" "$API/v1/agents/$id" | jq -e --arg r "github.com/$REPO" '[.repos[]?.url | ascii_downcase | contains($r|ascii_downcase)] | any' >/dev/null; then
+              echo "skip=1" >> $GITHUB_OUTPUT; echo "Agent $id already active for $REPO"; exit 0
+            fi
+          done
+      - name: Pick next task (oldest open agent-task issue)
+        if: steps.dedupe.outputs.skip != '1'
+        id: task
+        run: |
+          gh issue list -R "$REPO" --label agent-task --state open --limit 100 --json number,title,body,createdAt \
+            --jq 'sort_by(.createdAt) | .[0] // empty' > task.json
+          [ -s task.json ] || { echo "No agent-task issues"; echo "none=1" >> $GITHUB_OUTPUT; exit 0; }
+          echo "num=$(jq -r .number task.json)" >> $GITHUB_OUTPUT
+      - name: Resolve model (Composer 2.5 standard, never fast)
+        if: steps.task.outputs.num != ''
+        id: model
+        run: |
+          curl -fsS -u "$CURSOR_API_KEY:" "$API/v1/models" > models.json
+          id=$(jq -r '.items[] | select(.id=="composer-2.5" or ((.aliases//[])|index("composer-2.5"))) | .id' models.json | head -1)
+          [ -n "$id" ] || { echo "composer-2.5 not offered by /v1/models; refusing to fall back to another model"; jq -r '.items[].id' models.json; exit 1; }
+          hasfast=$(jq -r --arg id "$id" '.items[]|select(.id==$id)|[.parameters[]?.id]|index("fast")!=null' models.json)
+          if [ "$hasfast" = "true" ]; then
+            echo "json={\"id\":\"$id\",\"params\":[{\"id\":\"fast\",\"value\":\"false\"}]}" >> $GITHUB_OUTPUT
+          else echo "json={\"id\":\"$id\"}" >> $GITHUB_OUTPUT; fi
+      - name: Launch one agent
+        if: steps.task.outputs.num != ''
+        run: |
+          num=${{ steps.task.outputs.num }}
+          rules="PROJECT: $REPO ONLY. Rules: work on a new branch; write/run tests; open a DRAFT pull request only. NEVER merge, deploy, push to the default branch, change environment variables/secrets/databases, make payments/refunds, create real orders, or contact customers. Do not touch other repositories. Summarize results and blockers in the PR description. Reference issue #$num."
+          jq -n --arg t "$rules
+
+          TASK (issue #$num): $(jq -r .title task.json)
+
+          $(jq -r '.body // ""' task.json)" \
+            --arg url "https://github.com/$REPO" --argjson model '${{ steps.model.outputs.json }}' --arg name "$REPO#$num" \
+            '{prompt:{text:$t}, model:$model, name:($name[0:100]), repos:[{url:$url}], autoCreatePR:true, workOnCurrentBranch:false}' > body.json
+          curl -fsS -u "$CURSOR_API_KEY:" -H 'Content-Type: application/json' -d @body.json "$API/v1/agents" > resp.json
+          aurl=$(jq -r .agent.url resp.json)
+          gh label create agent-in-progress -R "$REPO" --color FBCA04 2>/dev/null || true
+          gh issue edit "$num" -R "$REPO" --add-label agent-in-progress --remove-label agent-task
+          gh issue comment "$num" -R "$REPO" --body "Cursor agent launched: $aurl (model $(jq -c .model body.json)). Draft PR only; owner must review/merge. Remove label agent-in-progress when done to allow the next task."
+          echo "Launched $aurl" >> "$GITHUB_STEP_SUMMARY"
