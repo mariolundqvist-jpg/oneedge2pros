@@ -1,0 +1,56 @@
+name: status
+# Lightweight status check. No AI, no secrets beyond GITHUB_TOKEN, no commits.
+# GitHub cron minimum is 5 min; scheduled runs are often delayed 5-30+ min and
+# are auto-disabled after 60 days without repo activity.
+on:
+  schedule: [{ cron: "17,47 * * * *" }]
+  workflow_dispatch:
+permissions: { contents: read, pull-requests: read, issues: write, checks: read }
+concurrency:
+  group: "status-${{ github.repository }}"
+  cancel-in-progress: true
+jobs:
+  status:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    env: { GH_TOKEN: "${{ github.token }}", REPO: "${{ github.repository }}" }
+    steps:
+      - name: Build status report
+        run: |
+          now=$(date -u +%s)
+          {
+            echo "# Status: $REPO"
+            echo "_Generated $(date -u +%FT%TZ) (UTC) by status.yml — read-only_"
+            echo
+            echo "| PR | Title | Draft | Updated (UTC) | CI | Stalled >2h |"
+            echo "|---|---|---|---|---|---|"
+            gh pr list -R "$REPO" --state open --limit 50 \
+              --json number,title,isDraft,updatedAt,statusCheckRollup |
+            jq -r --argjson now "$now" '.[] |
+              (.statusCheckRollup // []) as $c |
+              (if ($c|length)==0 then "none"
+               elif any($c[]; (.conclusion//.state) as $s | $s=="FAILURE" or $s=="ERROR" or $s=="CANCELLED" or $s=="TIMED_OUT") then "FAIL"
+               elif any($c[]; (.status//"") != "COMPLETED" and (.state//"") != "SUCCESS") then "pending"
+               else "pass" end) as $ci |
+              (($now - (.updatedAt|fromdateiso8601)) > 7200) as $stale |
+              "| #\(.number) | \(.title|gsub("\\|";"/")) | \(.isDraft) | \(.updatedAt) | \($ci) | \(if $stale then "YES" else "" end) |"'
+            echo
+            echo "## Open agent-task issues"
+            gh issue list -R "$REPO" --label agent-task --state open --limit 20 \
+              --json number,title --jq '.[] | "- #\(.number) \(.title)"' || echo "- (label missing)"
+            echo
+            echo "## Last failed workflow runs (24h)"
+            gh run list -R "$REPO" --status failure --limit 5 \
+              --json displayTitle,workflowName,createdAt,url \
+              --jq '.[] | "- \(.workflowName): \(.displayTitle) (\(.createdAt)) \(.url)"'
+          } > status.md
+          cat status.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Upsert single pinned status issue (edits one comment-free issue body; no commits)
+        run: |
+          n=$(gh issue list -R "$REPO" --label status-board --state open --limit 1 --json number --jq '.[0].number // empty')
+          if [ -z "$n" ]; then
+            gh label create status-board -R "$REPO" --color BFD4F2 --description "Auto status board" 2>/dev/null || true
+            gh issue create -R "$REPO" --title "STATUS board (auto)" --label status-board --body-file status.md
+          else
+            gh issue edit "$n" -R "$REPO" --body-file status.md
+          fi
